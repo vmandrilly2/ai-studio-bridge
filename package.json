@@ -14,21 +14,21 @@
   "contributes": {
     "commands": [
       {
-        "command": "ai-bridge.stageFiles",
-        "title": "Stage for AI Studio"
+        "command": "ai-bridge.stageWorkspace",
+        "title": "AI Studio: Stage Open Files & Structure"
       }
     ],
     "menus": {
       "explorer/context": [
         {
-          "command": "ai-bridge.stageFiles",
+          "command": "ai-bridge.stageWorkspace",
           "group": "navigation",
           "when": "resourceScheme == file"
         }
       ],
       "editor/title/context": [
         {
-          "command": "ai-bridge.stageFiles",
+          "command": "ai-bridge.stageWorkspace",
           "group": "navigation"
         }
       ]
