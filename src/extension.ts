@@ -2,14 +2,14 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import ignore from 'ignore'; 
 
 let currentStagingRoot: string = "";
 
 export function activate(context: vscode.ExtensionContext) {
-    // Register command to allow running via Command Palette (Ctrl+Shift+P)
     let disposable = vscode.commands.registerCommand('ai-bridge.stageWorkspace', async () => {
         
-        // 1. Setup Staging (Flat Folder)
+        // 1. Setup Staging
         const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
         currentStagingRoot = path.join(os.tmpdir(), 'ai-bridge', timestamp);
         const round1Dir = path.join(currentStagingRoot, 'round_1');
@@ -23,10 +23,24 @@ export function activate(context: vscode.ExtensionContext) {
 
         const stagedFilesList: string[] = [];
 
-        // 2. Generate Smart File Tree (Respecting .gitignore)
+        // 2. Initialize Ignore Filter (Root Level)
+        const ig = ignore();
+        // Always ignore these common clutter folders
+        ig.add(['.git', '.vscode', 'node_modules', 'dist', 'out', 'build', '__pycache__', '.DS_Store', 'venv', '.env']);
+        
+        // Load root .gitignore
+        const gitIgnorePath = path.join(workspaceFolder, '.gitignore');
+        if (fs.existsSync(gitIgnorePath)) {
+            try {
+                const gitIgnoreContent = fs.readFileSync(gitIgnorePath, 'utf-8');
+                ig.add(gitIgnoreContent);
+            } catch (e) { console.log("Could not read .gitignore"); }
+        }
+
+        // 3. Generate Tree
         try {
-            const ignores = parseGitIgnore(workspaceFolder);
-            const tree = generateFileTree(workspaceFolder, "", ignores);
+            // We pass the Workspace Root as the 'base' for calculating relative paths
+            const tree = generateFileTree(workspaceFolder, workspaceFolder, "", ig);
             const treePath = path.join(round1Dir, '_PROJECT_STRUCTURE.txt');
             fs.writeFileSync(treePath, tree);
             stagedFilesList.push("_PROJECT_STRUCTURE.txt");
@@ -34,39 +48,39 @@ export function activate(context: vscode.ExtensionContext) {
             console.error("Error generating tree", err);
         }
 
-        // 3. Stage Currently Opened Files (Flattened)
+        // 4. Stage Opened Files
         const openDocs = vscode.workspace.textDocuments;
-        
         for (const doc of openDocs) {
-            // Filter out output panel logs, git diffs, etc.
             if (doc.uri.scheme === 'file' && doc.fileName.startsWith(workspaceFolder)) {
                 const relativePath = path.relative(workspaceFolder, doc.fileName);
                 
-                // Flatten: src/components/App.tsx -> src__components__App.tsx
+                // Skip if it's ignored by git (optional, but good practice)
+                if (ig.ignores(relativePath)) continue;
+                if (relativePath.includes('_PROJECT_STRUCTURE')) continue;
+
+                // Flatten: src/utils/helper.ts -> src__utils__helper.ts
                 const flatName = relativePath.split(path.sep).join('__');
                 const destPath = path.join(round1Dir, flatName);
                 
-                // Save content
                 fs.writeFileSync(destPath, doc.getText());
                 stagedFilesList.push(relativePath);
             }
         }
 
-        // 4. Ask User for Goal
+        // 5. User Goal
         const userGoal = await vscode.window.showInputBox({ 
             prompt: "What is your goal?",
-            placeHolder: "e.g. Find where validation logic is located and fix the email regex"
+            placeHolder: "e.g. Fix the login bug in AuthController"
         });
         if (!userGoal) { return; }
 
-        // 5. Generate Prompt
+        // 6. Generate Prompt
         const systemPrompt = generateSystemPrompt(userGoal, stagedFilesList);
 
-        // 6. Launch UI
+        // 7. UI
         const panel = vscode.window.createWebviewPanel('aiBridge', 'AI Studio Staging', vscode.ViewColumn.Beside, { enableScripts: true });
         panel.webview.html = getWebviewContent(systemPrompt, round1Dir);
         
-        // Listeners 
         panel.webview.onDidReceiveMessage(async message => {
             if (message.command === 'openFolder') {
                 const dirToOpen = message.path || round1Dir;
@@ -78,66 +92,63 @@ export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(disposable);
 }
 
-// --- Helper: GitIgnore Parser ---
-function parseGitIgnore(root: string): string[] {
-    const ignorePath = path.join(root, '.gitignore');
-    const defaultIgnores = ['.git', 'node_modules', '.DS_Store', 'dist', 'out', 'build', '.vscode', '__pycache__'];
-    
-    if (fs.existsSync(ignorePath)) {
-        const content = fs.readFileSync(ignorePath, 'utf-8');
-        const lines = content.split('\n')
-            .map(l => l.trim())
-            .filter(l => l && !l.startsWith('#'))
-            // Simple conversion: remove trailing slashes
-            .map(l => l.replace(/\/$/, '')); 
-        return [...defaultIgnores, ...lines];
-    }
-    return defaultIgnores;
-}
-
-// --- Helper: Recursive Tree Generation ---
-function generateFileTree(dir: string, prefix = '', ignores: string[]): string {
+/**
+ * Recursive Tree Generator
+ * @param currentDir The absolute path of the directory we are currently crawling
+ * @param rootDir The absolute path of the workspace root (used to calculate relative paths for .gitignore)
+ * @param prefix The visual prefix for the tree (│   ├── )
+ * @param ig The ignore instance
+ */
+function generateFileTree(currentDir: string, rootDir: string, prefix: string, ig: any): string {
     let output = '';
-    const name = path.basename(dir);
+    let entries: fs.Dirent[] = [];
     
-    // Basic ignore filtering (simple string matching, not full glob support for simplicity)
-    if (ignores.includes(name)) { return ''; }
-
     try {
-        let entries = fs.readdirSync(dir, { withFileTypes: true });
-        
-        // Sort: Directories first, then files
-        entries.sort((a, b) => {
-            if (a.isDirectory() && !b.isDirectory()) return -1;
-            if (!a.isDirectory() && b.isDirectory()) return 1;
-            return a.name.localeCompare(b.name);
-        });
-
-        // Filter entries based on ignores
-        entries = entries.filter(e => !ignores.includes(e.name));
-
-        entries.forEach((entry, index) => {
-            const isLast = index === entries.length - 1;
-            const marker = isLast ? '└── ' : '├── ';
-            const newPrefix = prefix + (isLast ? '    ' : '│   ');
-            
-            output += `${prefix}${marker}${entry.name}\n`;
-            
-            if (entry.isDirectory()) {
-                output += generateFileTree(path.join(dir, entry.name), newPrefix, ignores);
-            }
-        });
+        entries = fs.readdirSync(currentDir, { withFileTypes: true });
     } catch (e) { return ''; }
+
+    // Sort: Directories first, then files
+    entries.sort((a, b) => {
+        if (a.isDirectory() && !b.isDirectory()) return -1;
+        if (!a.isDirectory() && b.isDirectory()) return 1;
+        return a.name.localeCompare(b.name);
+    });
+
+    // Filter entries using the Ignore instance
+    const filteredEntries = entries.filter(entry => {
+        const absolutePath = path.join(currentDir, entry.name);
+        // Get path relative to WORKSPACE ROOT (e.g., "Backend/venv")
+        let relativePath = path.relative(rootDir, absolutePath);
+        
+        // Convert Windows backslashes to forward slashes for the 'ignore' library
+        relativePath = relativePath.split(path.sep).join('/');
+
+        // If it's a directory, the ignore lib sometimes likes a trailing slash to match rules like "folder/"
+        if (entry.isDirectory()) {
+            relativePath += '/';
+        }
+
+        return !ig.ignores(relativePath);
+    });
+
+    filteredEntries.forEach((entry, index) => {
+        const isLast = index === filteredEntries.length - 1;
+        const marker = isLast ? '└── ' : '├── ';
+        
+        output += `${prefix}${marker}${entry.name}\n`;
+        
+        if (entry.isDirectory()) {
+            const newPrefix = prefix + (isLast ? '    ' : '│   ');
+            output += generateFileTree(path.join(currentDir, entry.name), rootDir, newPrefix, ig);
+        }
+    });
     
     return output;
 }
 
 function generateSystemPrompt(goal: string, fileList: string[]): string {
-    // Filter out structure file from the "Opened Files" list for clarity
-    const openedFiles = fileList.filter(f => f !== '_PROJECT_STRUCTURE.txt');
-
     return `I am attaching a set of files. 
-1. "_PROJECT_STRUCTURE.txt": Contains the full file tree of the project.
+1. "_PROJECT_STRUCTURE.txt": Contains the full file tree of the codebase (respecting .gitignore).
 2. Source code files: These are the tabs I currently have open. (Note: filenames are flattened, e.g. "src__utils.ts" maps to "src/utils.ts").
 
 GOAL: ${goal}
@@ -177,20 +188,17 @@ function getWebviewContent(prompt: string, folderPath: string) {
     <html>
     <body style="font-family: sans-serif; padding: 20px;">
         <h2>🚀 Staging Complete</h2>
-        
         <div style="background: #252526; padding: 15px; border-radius: 5px; margin-bottom: 20px;">
             <h3 style="margin-top:0;">1. Files Ready</h3>
             <p>Folder contains your open tabs + Project Structure.</p>
             <button onclick="openFolder()" style="padding: 8px 16px; cursor: pointer;">📂 Open Folder (Ctrl+A -> Drag to AI Studio)</button>
         </div>
-
         <div style="background: #252526; padding: 15px; border-radius: 5px;">
             <h3 style="margin-top:0;">2. System Prompt</h3>
             <textarea id="p" style="width:100%; height:200px; background: #1e1e1e; color: #d4d4d4; border: 1px solid #3c3c3c;">${prompt}</textarea>
             <br/><br/>
             <button onclick="copyText()" style="padding: 8px 16px; cursor: pointer;">📋 Copy Prompt</button>
         </div>
-
         <script>
             const vscode = acquireVsCodeApi();
             function openFolder() { vscode.postMessage({command: 'openFolder', path: '${safePath}'}); }
