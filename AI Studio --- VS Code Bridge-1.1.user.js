@@ -100,7 +100,8 @@
             // Find the <code> element inside
             const codeElement = lastBlock.querySelector('code');
             if (codeElement) {
-                content = codeElement.innerText;
+                // textContent is safer than innerText as it avoids CSS styling artifacts
+                content = codeElement.textContent;
             }
         }
 

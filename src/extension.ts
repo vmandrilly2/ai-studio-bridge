@@ -182,14 +182,54 @@ export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(disposable, applyDisposable);
 }
 
+function normalizeJsonLikeResponse(t: string): string {
+    let s = t;
+    const r = /"content"\s*:\s*"(<<<<<<< SEARCH[\s\S]*?>>>>>>> REPLACE)"/g;
+    s = s.replace(r, (_m, g1) => {
+        const esc = g1.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+        return '"content":"' + esc + '"';
+    });
+    return s;
+}
+
 async function handleAIResponse(jsonText: string, workspaceRoot: string, goal: string) {
     let data: any;
     try {
-        let cleanJson = jsonText.trim();
-        if (cleanJson.startsWith('```')) {
-            cleanJson = cleanJson.replace(/^```(json)?\s*/, '').replace(/\s*```$/, '');
+        let t = normalizeJsonLikeResponse(jsonText.trim());
+        const candidates: string[] = [];
+        const fenceStart = t.indexOf('```');
+        if (fenceStart !== -1) {
+            const fenceEnd = t.indexOf('```', fenceStart + 3);
+            if (fenceEnd !== -1) {
+                let inner = t.slice(fenceStart + 3, fenceEnd).trim();
+                inner = inner.replace(/^json\s*/, '').trim();
+                candidates.push(inner);
+            } else {
+                candidates.push(t.replace(/^```(json)?\s*/, '').replace(/\s*```$/, '').trim());
+            }
         }
-        const parsed = JSON.parse(cleanJson);
+        candidates.push(t);
+        const bStart = t.indexOf('[');
+        const bEnd = t.lastIndexOf(']');
+        if (bStart !== -1 && bEnd !== -1 && bEnd > bStart) {
+            candidates.push(t.substring(bStart, bEnd + 1));
+        }
+        const oStart = t.indexOf('{');
+        const oEnd = t.lastIndexOf('}');
+        if (oStart !== -1 && oEnd !== -1 && oEnd > oStart) {
+            candidates.push(t.substring(oStart, oEnd + 1));
+        }
+        let parsed: any;
+        let ok = false;
+        for (const c of candidates) {
+            if (!c) { continue; }
+            try {
+                parsed = JSON.parse(c);
+                ok = true;
+                break;
+            } catch {}
+        }
+        if (!ok) { throw new Error('parse'); }
         if (Array.isArray(parsed)) {
             data = { status: 'COMPLETED', code_changes: parsed };
         } else if (parsed && !parsed.status && Array.isArray(parsed.code_changes)) {

@@ -2,7 +2,7 @@
   "name": "ai-studio-bridge",
   "displayName": "AI Studio Bridge",
   "description": "Helper to stage files for Google AI Studio",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "publisher": "local",
   "engines": {
     "vscode": "^1.60.0"
