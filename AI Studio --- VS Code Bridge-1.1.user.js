@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AI Studio <-> VS Code Bridge
 // @namespace    http://tampermonkey.net/
-// @version      1.2
+// @version      1.6
 // @description  Automate moving text between AI Studio and VS Code
 // @author       You
 // @match        https://aistudio.google.com/*
@@ -13,8 +13,12 @@
 
     const VSCODE_API = "http://localhost:54321";
 
+    function log(msg, data = null) {
+        if (data) console.log(`[AI Bridge] ${msg}`, data);
+        else console.log(`[AI Bridge] ${msg}`);
+    }
+
     function createUI() {
-        // Prevent duplicate buttons if script re-runs
         if (document.getElementById('ai-bridge-container')) return;
 
         const div = document.createElement('div');
@@ -48,12 +52,11 @@
         div.appendChild(btnPull);
         div.appendChild(btnPush);
         document.body.appendChild(div);
+        log("UI Created");
     }
 
-    // 1. FETCH FROM VS CODE
     function fetchFromVSCode(silent = false) {
         const btn = document.getElementById('btn-pull');
-        const originalText = btn ? btn.innerText : "⬇️ Load Prompt";
         if (btn) btn.innerText = "⏳ Loading...";
 
         GM_xmlhttpRequest({
@@ -63,112 +66,123 @@
                 if (response.status === 200) {
                     const data = JSON.parse(response.responseText);
 
-                    // Try generic textarea first
                     let input = document.querySelector('textarea');
-
-                    // Fallback for different AI Studio versions/states
                     if (!input) input = document.querySelector('div[contenteditable="true"]');
 
                     if (input) {
-                        // Native value setter often required for React/Angular inputs
+                        // Wrap in markdown block to preserve structure in AI Studio
+                        const safeContent = "```\n" + data.prompt + "\n```";
+                        
                         const nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set;
                         if (nativeInputValueSetter && input instanceof HTMLTextAreaElement) {
-                            nativeInputValueSetter.call(input, data.prompt);
+                            nativeInputValueSetter.call(input, safeContent);
                         } else {
-                            input.value = data.prompt;
-                            input.innerText = data.prompt;
+                            input.value = safeContent;
+                            input.innerText = safeContent;
                         }
 
                         input.dispatchEvent(new Event('input', { bubbles: true }));
                         
                         if (btn) {
                             btn.innerText = "✅ Loaded!";
-                            setTimeout(() => btn.innerText = originalText, 2000);
+                            setTimeout(() => btn.innerText = "⬇️ Load Prompt", 2000);
                         }
-                        // Removed alert as requested
                     } else {
                         if (!silent) alert("Could not find input box. Click the chat input first.");
-                        if (btn) btn.innerText = originalText;
+                        if (btn) btn.innerText = "⬇️ Load Prompt";
                     }
                 } else {
                     if (!silent) alert("VS Code not responding.");
-                    if (btn) btn.innerText = originalText;
+                    if (btn) btn.innerText = "⬇️ Load Prompt";
                 }
             },
             onerror: () => {
                 if (!silent) alert("Connection failed. Check VS Code.");
-                if (btn) btn.innerText = originalText;
+                if (btn) btn.innerText = "⬇️ Load Prompt";
             }
         });
     }
 
-    // 2. SCRAPE AI STUDIO -> SEND TO VS CODE
     function sendToVSCode() {
+        log("Attempting to extract code...");
         let content = "";
 
-        // STRATEGY A: Target the code blocks identified in your snippet
-        const codeBlocks = document.querySelectorAll('ms-code-block');
+        // Strategy 1: Find all 'pre code' or 'code' blocks
+        // AI Studio usually wraps code in <pre> or specific containers
+        const codeBlocks = Array.from(document.querySelectorAll('pre code, code, ms-code-block code'));
+        log(`Found ${codeBlocks.length} code blocks.`);
 
-        if (codeBlocks.length > 0) {
-            // Get the very last code block in the chat history
-            const lastBlock = codeBlocks[codeBlocks.length - 1];
-
-            // Find the <code> element inside
-            const codeElement = lastBlock.querySelector('code');
-            if (codeElement) {
-                // textContent is safer than innerText as it avoids CSS styling artifacts
-                content = codeElement.textContent;
+        // We are specifically looking for the LAST block that looks like a JSON response
+        // The AI output is usually at the bottom. The prompt might be at the top.
+        for (let i = codeBlocks.length - 1; i >= 0; i--) {
+            const text = codeBlocks[i].innerText || codeBlocks[i].textContent;
+            // Check if it looks like the JSON schema we expect
+            if (text.includes('"status":') && (text.includes('"COMPLETED"') || text.includes('"NEED_CONTEXT"'))) {
+                content = text;
+                log("Found JSON-like block at index " + i);
+                break;
             }
         }
 
-        // STRATEGY B: Fallback to manual text selection
-        if (!content) {
-            content = window.getSelection().toString();
+        // Strategy 2: If no JSON block found, try the very last code block of any kind
+        if (!content && codeBlocks.length > 0) {
+            log("No obvious JSON block found. Fallback to last code block.");
+            content = codeBlocks[codeBlocks.length - 1].innerText || codeBlocks[codeBlocks.length - 1].textContent;
         }
 
-        // Validation
+        // Strategy 3: Selection
         if (!content) {
-            alert("Could not find any code blocks (ms-code-block) and no text is selected.");
+            content = window.getSelection().toString();
+            if (content) log("Using text selection.");
+        }
+
+        if (!content) {
+            alert("Could not find any code blocks and no text is selected.");
             return;
         }
+
+        log("Payload length:", content.length);
+        log("Payload snippet:", content.substring(0, 100));
 
         const btn = document.getElementById('btn-push');
         const originalText = btn ? btn.innerText : "⬆️ Send Code";
         if (btn) btn.innerText = "⏳ Sending...";
 
-        // Send
         GM_xmlhttpRequest({
             method: "POST",
             url: `${VSCODE_API}/response`,
             headers: { "Content-Type": "application/json" },
             data: JSON.stringify({ text: content }),
             onload: function(response) {
+                log("Response status:", response.status);
                 if (response.status === 200) {
                     const respData = JSON.parse(response.responseText);
                     
-                    // Visual feedback
                     if (btn) {
                         btn.innerText = "✅ Sent!";
                         setTimeout(() => btn.innerText = originalText, 2000);
                     }
 
-                    // AUTO-ACTION: If VS Code requests context, pull it automatically
+                    // AUTO-LOAD if VS Code requested context
                     if (respData.result && respData.result.action === 'NEED_CONTEXT') {
-                        // Small delay to let UI settle
+                        log("Context requested. Auto-loading...");
                         setTimeout(() => fetchFromVSCode(true), 500);
                     }
                 } else {
-                    alert("Error sending to VS Code.");
-                    if (btn) btn.innerText = originalText;
+                    alert("Error sending to VS Code. Check console logs.");
+                    if (btn) {
+                        btn.innerText = "❌ Error";
+                        setTimeout(() => btn.innerText = originalText, 2000);
+                    }
                 }
             },
-            onerror: () => {
+            onerror: (err) => {
+                log("Connection error", err);
                 alert("Connection failed.");
                 if (btn) btn.innerText = originalText;
             }
         });
     }
 
-    // Initialize
     setTimeout(createUI, 3000);
 })();

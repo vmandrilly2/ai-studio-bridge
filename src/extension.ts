@@ -34,7 +34,6 @@ export function activate(context: vscode.ExtensionContext) {
             // ENDPOINT: GET /prompt (Browser asks for the task)
             if (req.method === 'GET' && req.url === '/prompt') {
                 if (!currentRoundDir || !fs.existsSync(currentRoundDir)) {
-                     // Graceful fallback if user hasn't staged yet
                      const warning = "WARNING: No files staged. Please run 'AI Bridge: Stage Workspace' in VS Code first.";
                      res.writeHead(200, { 'Content-Type': 'application/json' });
                      res.end(JSON.stringify({ prompt: warning }));
@@ -50,13 +49,14 @@ export function activate(context: vscode.ExtensionContext) {
             if (req.method === 'POST' && req.url === '/response') {
                 let body = '';
                 req.on('data', chunk => body += chunk);
-                req.on('end', () => {
+                req.on('end', async () => {
                     try {
                         const data = JSON.parse(body);
-                        vscode.commands.executeCommand('ai-bridge.applyResponse', data.text);
+                        const result = await vscode.commands.executeCommand('ai-bridge.applyResponse', data.text);
                         res.writeHead(200, { 'Content-Type': 'application/json' });
-                        res.end(JSON.stringify({ status: 'received' }));
+                        res.end(JSON.stringify({ status: 'received', result }));
                     } catch (e) {
+                        console.error("[AI Bridge] JSON Parse Error on Server:", e);
                         res.writeHead(400);
                         res.end('Invalid JSON');
                     }
@@ -173,15 +173,17 @@ export function activate(context: vscode.ExtensionContext) {
     // 3. APPLY COMMAND (INTERNAL)
     let applyDisposable = vscode.commands.registerCommand('ai-bridge.applyResponse', async (jsonText: string) => {
         if (currentWorkspaceRoot) {
-            await handleAIResponse(jsonText, currentWorkspaceRoot, currentUserGoal);
+            return await handleAIResponse(jsonText, currentWorkspaceRoot, currentUserGoal);
         } else {
              vscode.window.showErrorMessage("No active workspace context. Run 'Stage Workspace' first.");
+             return { action: 'ERROR' };
         }
     });
 
     context.subscriptions.push(disposable, applyDisposable);
 }
 
+// Helper: Fix double-encoded JSON issues in content fields
 function normalizeJsonLikeResponse(t: string): string {
     let s = t;
     const r = /"content"\s*:\s*"(<<<<<<< SEARCH[\s\S]*?>>>>>>> REPLACE)"/g;
@@ -192,10 +194,13 @@ function normalizeJsonLikeResponse(t: string): string {
     return s;
 }
 
-async function handleAIResponse(jsonText: string, workspaceRoot: string, goal: string) {
+async function handleAIResponse(jsonText: string, workspaceRoot: string, goal: string): Promise<{ action: string }> {
+    console.log("[AI Bridge] Handling Response. Length:", jsonText.length);
     let data: any;
     try {
         let t = normalizeJsonLikeResponse(jsonText.trim());
+        
+        // Try to extract JSON from code fences if present
         const candidates: string[] = [];
         const fenceStart = t.indexOf('```');
         if (fenceStart !== -1) {
@@ -205,10 +210,13 @@ async function handleAIResponse(jsonText: string, workspaceRoot: string, goal: s
                 inner = inner.replace(/^json\s*/, '').trim();
                 candidates.push(inner);
             } else {
+                // maybe fence at end
                 candidates.push(t.replace(/^```(json)?\s*/, '').replace(/\s*```$/, '').trim());
             }
         }
         candidates.push(t);
+
+        // Try sub-block heuristics
         const bStart = t.indexOf('[');
         const bEnd = t.lastIndexOf(']');
         if (bStart !== -1 && bEnd !== -1 && bEnd > bStart) {
@@ -219,6 +227,7 @@ async function handleAIResponse(jsonText: string, workspaceRoot: string, goal: s
         if (oStart !== -1 && oEnd !== -1 && oEnd > oStart) {
             candidates.push(t.substring(oStart, oEnd + 1));
         }
+
         let parsed: any;
         let ok = false;
         for (const c of candidates) {
@@ -229,7 +238,12 @@ async function handleAIResponse(jsonText: string, workspaceRoot: string, goal: s
                 break;
             } catch {}
         }
-        if (!ok) { throw new Error('parse'); }
+
+        if (!ok) { 
+            console.error("[AI Bridge] Parsing failed. Raw content (first 500 chars):", t.substring(0, 500));
+            throw new Error('parse'); 
+        }
+
         if (Array.isArray(parsed)) {
             data = { status: 'COMPLETED', code_changes: parsed };
         } else if (parsed && !parsed.status && Array.isArray(parsed.code_changes)) {
@@ -238,8 +252,8 @@ async function handleAIResponse(jsonText: string, workspaceRoot: string, goal: s
             data = parsed;
         }
     } catch (e) {
-        vscode.window.showErrorMessage("Invalid JSON. Please ensure you pasted valid JSON (optionally inside ```json code fences).");
-        return;
+        vscode.window.showErrorMessage("Invalid JSON. Check VS Code Debug Console for raw output.");
+        return { action: 'ERROR' };
     }
 
     if (data.status === 'COMPLETED') {
@@ -274,6 +288,8 @@ async function handleAIResponse(jsonText: string, workspaceRoot: string, goal: s
                             workingContent = applySearchReplace(workingContent, change.content);
                         }
                     }
+                    
+                    // Apply the edit to the open document or create new
                     if (doc) {
                         const fullRange = new vscode.Range(
                             doc.positionAt(0),
@@ -294,6 +310,25 @@ async function handleAIResponse(jsonText: string, workspaceRoot: string, goal: s
                 const success = await vscode.workspace.applyEdit(edit);
                 if (success) {
                     vscode.window.showInformationMessage(`Applied changes to ${appliedCount} files. Please review and save.`);
+                    try {
+                        // Snapshot this round
+                        const modifiedFiles = Array.from(changesByFile.keys());
+                        currentRound++;
+                        const roundDir = path.join(currentStagingRoot, `round_${currentRound}`);
+                        fs.mkdirSync(roundDir, { recursive: true });
+                        for (const fp of modifiedFiles) {
+                            const srcPath = path.join(workspaceRoot, fp);
+                            if (fs.existsSync(srcPath)) {
+                                const flatName = fp.split('/').join('__') + '.txt';
+                                fs.copyFileSync(srcPath, path.join(roundDir, flatName));
+                            }
+                        }
+                        currentRoundDir = roundDir;
+                        lastSystemPrompt = "Here are the modified pages after changes, please confirm to the user if the changes have been correctly applied.";
+                        if (currentPanel) {
+                            updateWebview(currentPanel, lastSystemPrompt, roundDir);
+                        }
+                    } catch {}
                 } else {
                     vscode.window.showErrorMessage("Failed to apply workspace edit.");
                 }
@@ -303,8 +338,8 @@ async function handleAIResponse(jsonText: string, workspaceRoot: string, goal: s
         } else {
             vscode.window.showWarningMessage("Status is COMPLETED but no code_changes found.");
         }
+        return { action: 'COMPLETED' };
     } else if (data.status === 'NEED_CONTEXT') {
-        // Handle Context Request -> New Round
         currentRound++;
         const roundDir = path.join(currentStagingRoot, `round_${currentRound}`);
         fs.mkdirSync(roundDir, { recursive: true });
@@ -312,7 +347,6 @@ async function handleAIResponse(jsonText: string, workspaceRoot: string, goal: s
         currentRoundDir = roundDir;
         const stagedFiles: string[] = [];
 
-        // 1. Copy requested files
         if (data.request_files && Array.isArray(data.request_files)) {
             for (const reqFile of data.request_files) {
                 const srcPath = path.join(workspaceRoot, reqFile);
@@ -324,14 +358,15 @@ async function handleAIResponse(jsonText: string, workspaceRoot: string, goal: s
             }
         }
         
-        // 2. Update Webview (if active) and Open Folder
         if (currentPanel) {
             updateWebview(currentPanel, lastSystemPrompt, roundDir);
         }
         
         vscode.window.showInformationMessage(`Round ${currentRound} prepared with ${stagedFiles.length} files.`);
+        return { action: 'NEED_CONTEXT' };
     } else {
         vscode.window.showWarningMessage("Response missing valid status. Paste either an object with 'status' or an array of code changes.");
+        return { action: 'UNKNOWN' };
     }
 }
 
@@ -433,12 +468,18 @@ function applySearchReplace(original: string, diff: string): string {
     let match;
     while ((match = blockRegex.exec(diff)) !== null) {
         const [_, search, replace] = match;
-        const escapedSearch = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        const searchPattern = escapedSearch.split(/\r?\n/).join('\\r?\\n');
-        const searchRegex = new RegExp(searchPattern);
         
-        if (searchRegex.test(result)) {
-            result = result.replace(searchRegex, replace);
+        // Normalize line endings to LF for reliable matching
+        const normalize = (s: string) => s.replace(/\r\n/g, '\n');
+        const normalizedResult = normalize(result);
+        const normalizedSearch = normalize(search);
+        
+        const index = normalizedResult.indexOf(normalizedSearch);
+        
+        if (index !== -1) {
+            // Replace content in the normalized string - Note: This converts mixed line endings to LF
+            // This is generally acceptable for modern VS Code dev.
+            result = normalizedResult.substring(0, index) + replace + normalizedResult.substring(index + normalizedSearch.length);
         } else {
              vscode.window.showWarningMessage("Could not find SEARCH block in file. Check line endings and indentation.");
         }
