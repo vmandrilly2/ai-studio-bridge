@@ -1,0 +1,5 @@
+Gemini 3 Pro Preview Rate Limits (Free Tier)
+Limit Type	Limit Amount	Notes
+RPM (Requests Per Minute)	60 RPM	This is the standard burst limit for the preview model.
+TPM (Tokens Per Minute)	32,000 TPM	Combined limit for input and output tokens.[1]
+RPD (Requests Per Day)	1,500 RPD	The total number of requests you can make in a 24-hour rolling window.

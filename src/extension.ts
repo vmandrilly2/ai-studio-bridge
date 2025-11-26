@@ -18,7 +18,7 @@ const PORT = 54321;
 export function activate(context: vscode.ExtensionContext) {
     // 1. START LOCAL SERVER
     try {
-        server = http.createServer(async (req, res) => {
+        server = http.createServer(async (req: http.IncomingMessage, res: http.ServerResponse) => {
             // Fix for CORS and Private Network Access (PNA) blocks in Chrome/Firefox
             res.setHeader('Access-Control-Allow-Origin', '*');
             res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -48,7 +48,7 @@ export function activate(context: vscode.ExtensionContext) {
             // ENDPOINT: POST /response (Browser sends the AI solution)
             if (req.method === 'POST' && req.url === '/response') {
                 let body = '';
-                req.on('data', chunk => body += chunk);
+                req.on('data', (chunk: Buffer) => body += chunk.toString());
                 req.on('end', async () => {
                     try {
                         const data = JSON.parse(body);
@@ -263,7 +263,7 @@ async function handleAIResponse(jsonText: string, workspaceRoot: string, goal: s
 
             const changesByFile = new Map<string, any[]>();
             for (const change of data.code_changes) {
-                if (change.type === 'FULL_REWRITE' || change.type === 'DIFF') {
+                if (change.type === 'FULL_REWRITE' || change.type === 'DIFF' || change.type === 'PATCH') {
                     const arr = changesByFile.get(change.file_path) || [];
                     arr.push(change);
                     changesByFile.set(change.file_path, arr);
@@ -284,8 +284,11 @@ async function handleAIResponse(jsonText: string, workspaceRoot: string, goal: s
                     for (const change of changes) {
                         if (change.type === 'FULL_REWRITE') {
                             workingContent = change.content;
-                        } else {
+                        } else if (change.type === 'DIFF') {
                             workingContent = applySearchReplace(workingContent, change.content);
+                        } else if (change.type === 'PATCH') {
+                            const asDiff = patchEnvelopeToDiffForFile(change.content, change.file_path);
+                            workingContent = applySearchReplace(workingContent, asDiff);
                         }
                     }
                     
@@ -347,6 +350,15 @@ async function handleAIResponse(jsonText: string, workspaceRoot: string, goal: s
         currentRoundDir = roundDir;
         const stagedFiles: string[] = [];
 
+        // Try to keep project structure available
+        try {
+             const structFile = path.join(currentStagingRoot, 'round_1', '_PROJECT_STRUCTURE.txt');
+             if (fs.existsSync(structFile)) {
+                 fs.copyFileSync(structFile, path.join(roundDir, '_PROJECT_STRUCTURE.txt'));
+                 stagedFiles.push("_PROJECT_STRUCTURE.txt");
+             }
+        } catch {}
+
         if (data.request_files && Array.isArray(data.request_files)) {
             for (const reqFile of data.request_files) {
                 const srcPath = path.join(workspaceRoot, reqFile);
@@ -358,6 +370,9 @@ async function handleAIResponse(jsonText: string, workspaceRoot: string, goal: s
             }
         }
         
+        // RE-GENERATE PROMPT with new files and instructions so AI knows what to do
+        lastSystemPrompt = generateSystemPrompt(goal, stagedFiles);
+
         if (currentPanel) {
             updateWebview(currentPanel, lastSystemPrompt, roundDir);
         }
@@ -432,16 +447,19 @@ A. IF YOU HAVE ENOUGH CONTEXT:
    Set "status": "COMPLETED".
    Provide the code in "code_changes".
    - Use "type": "FULL_REWRITE" for new files or when rewriting the entire content.
-   - Use "type": "DIFF" for partial edits. Format content as SEARCH/REPLACE blocks:
-     <<<<<<< SEARCH
-     original code line 1
-     original code line 2
-     =======
-     new code line 1
-     new code line 2
-     >>>>>>> REPLACE
+   - Use "type": "PATCH" for partial edits. Content MUST be a patch envelope we can apply:
 
-   *Note*: SEARCH must match exact indentation and whitespace. Line endings are normalized (CRLF/LF), but indentation must match exactly.
+     *** Begin Patch
+     *** Update File: src/path/to/file.ts
+     @@
+     -old line
+     +new line
+     *** End Patch
+
+   Rules:
+   - Use relative file paths.
+   - Include only the hunks relevant to the target file.
+   - Prefix context with a single space, removals with '-', additions with '+'.
 
 B. IF YOU NEED MORE CONTEXT:
    Set "status": "NEED_CONTEXT".
@@ -455,7 +473,7 @@ JSON SCHEMA:
   "code_changes": [
     {
       "file_path": "src/components/App.tsx",
-      "type": "FULL_REWRITE" | "DIFF", 
+      "type": "FULL_REWRITE" | "PATCH", 
       "content": "..."
     }
   ]
@@ -485,6 +503,44 @@ function applySearchReplace(original: string, diff: string): string {
         }
     }
     return result;
+}
+
+function patchEnvelopeToDiffForFile(patch: string, targetFile: string): string {
+    const lines = patch.split(/\r?\n/);
+    let inUpdate = false;
+    let collects: string[] = [];
+    let outBlocks: string[] = [];
+    const pushBlock = () => {
+        if (collects.length > 0) {
+            const hunk = collects.join('\n');
+            const hLines = hunk.split('\n');
+            const search: string[] = [];
+            const replace: string[] = [];
+            for (const l of hLines) {
+                if (l.startsWith(' ')) { search.push(l.slice(1)); replace.push(l.slice(1)); }
+                else if (l.startsWith('-')) { search.push(l.slice(1)); }
+                else if (l.startsWith('+')) { replace.push(l.slice(1)); }
+            }
+            outBlocks.push('<<<<<<< SEARCH\n' + search.join('\n') + '\n=======\n' + replace.join('\n') + '\n>>>>>>> REPLACE');
+            collects = [];
+        }
+    };
+    for (let i = 0; i < lines.length; i++) {
+        const l = lines[i];
+        if (l.startsWith('*** Update File:')) {
+            const f = l.replace('*** Update File:', '').trim();
+            inUpdate = (f === targetFile);
+            continue;
+        }
+        if (!inUpdate) { continue; }
+        if (l.startsWith('@@')) { pushBlock(); collects = []; continue; }
+        if (l.startsWith('*** End Patch')) { break; }
+        if (l.startsWith(' ') || l.startsWith('-') || l.startsWith('+')) {
+            collects.push(l);
+        }
+    }
+    pushBlock();
+    return outBlocks.join('\n');
 }
 
 function updateWebview(panel: vscode.WebviewPanel, prompt: string, folderPath: string) {
