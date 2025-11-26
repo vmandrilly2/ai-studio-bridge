@@ -19,7 +19,8 @@
     "commands": [
       {
         "command": "ai-bridge.stageWorkspace",
-        "title": "AI Studio: Stage Open Files & Structure"
+        "title": "AI Studio: Stage Open Files & Structure",
+        "icon": "$(rocket)"
       }
     ],
     "menus": {
@@ -31,6 +32,12 @@
         }
       ],
       "editor/title/context": [
+        {
+          "command": "ai-bridge.stageWorkspace",
+          "group": "navigation"
+        }
+      ],
+      "editor/title": [
         {
           "command": "ai-bridge.stageWorkspace",
           "group": "navigation"

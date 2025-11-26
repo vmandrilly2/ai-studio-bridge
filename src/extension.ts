@@ -97,17 +97,29 @@ export function activate(context: vscode.ExtensionContext) {
 }
 
 async function handleAIResponse(jsonText: string, workspaceRoot: string, goal: string, panel: vscode.WebviewPanel) {
-    let data;
+    let data: any;
     try {
-        data = JSON.parse(jsonText);
+        let cleanJson = jsonText.trim();
+        if (cleanJson.startsWith('```')) {
+            cleanJson = cleanJson.replace(/^```(json)?\s*/, '').replace(/\s*```$/, '');
+        }
+        const parsed = JSON.parse(cleanJson);
+        if (Array.isArray(parsed)) {
+            data = { status: 'COMPLETED', code_changes: parsed };
+        } else if (parsed && !parsed.status && Array.isArray(parsed.code_changes)) {
+            data = { ...parsed, status: 'COMPLETED' };
+        } else {
+            data = parsed;
+        }
     } catch (e) {
-        vscode.window.showErrorMessage("Invalid JSON. Please ensure you pasted the full code block.");
+        vscode.window.showErrorMessage("Invalid JSON. Please ensure you pasted valid JSON (optionally inside ```json code fences).");
         return;
     }
 
     if (data.status === 'COMPLETED') {
         if (data.code_changes && Array.isArray(data.code_changes)) {
             let appliedCount = 0;
+            let manifestChanged = false;
             for (const change of data.code_changes) {
                 if (change.type === 'FULL_REWRITE' || change.type === 'DIFF') {
                     // Currently treating DIFF as full rewrite if content is provided, or we could add real diff logic later
@@ -117,12 +129,24 @@ async function handleAIResponse(jsonText: string, workspaceRoot: string, goal: s
                         fs.mkdirSync(path.dirname(targetPath), { recursive: true });
                         fs.writeFileSync(targetPath, change.content);
                         appliedCount++;
+                        const fp = String(change.file_path || '').toLowerCase().replace(/\\/g, '/');
+                        if (fp.endsWith('package.json')) { manifestChanged = true; }
                     } catch (err) {
                         vscode.window.showErrorMessage(`Failed to write ${change.file_path}`);
                     }
                 }
             }
             vscode.window.showInformationMessage(`Success! Updated ${appliedCount} files.`);
+            if (manifestChanged) {
+                const sel = await vscode.window.showInformationMessage(
+                    'Extension manifest updated. Reload Window to apply UI/menu changes?',
+                    'Reload Now',
+                    'Later'
+                );
+                if (sel === 'Reload Now') {
+                    await vscode.commands.executeCommand('workbench.action.reloadWindow');
+                }
+            }
         } else {
             vscode.window.showWarningMessage("Status is COMPLETED but no code_changes found.");
         }
@@ -165,6 +189,8 @@ async function handleAIResponse(jsonText: string, workspaceRoot: string, goal: s
         updateWebview(panel, newPrompt, roundDir);
         
         vscode.window.showInformationMessage(`Round ${currentRound} prepared with ${stagedFiles.length} files.`);
+    } else {
+        vscode.window.showWarningMessage("Response missing valid status. Paste either an object with 'status' or an array of code changes.");
     }
 }
 
@@ -209,7 +235,7 @@ function generateSystemPrompt(goal: string, fileList: string[]): string {
 GOAL: ${goal}
 
 INSTRUCTIONS:
-You are an expert coding assistant. Output response in STRICT JSON.
+You are an expert coding assistant. Output response in STRICT JSON format, wrapped in a markdown code block (e.g. \`\`\`json ... \`\`\`).
 
 A. IF YOU HAVE ENOUGH CONTEXT:
    Set "status": "COMPLETED".
