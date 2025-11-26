@@ -118,34 +118,49 @@ async function handleAIResponse(jsonText: string, workspaceRoot: string, goal: s
 
     if (data.status === 'COMPLETED') {
         if (data.code_changes && Array.isArray(data.code_changes)) {
+            const edit = new vscode.WorkspaceEdit();
             let appliedCount = 0;
-            let manifestChanged = false;
+
             for (const change of data.code_changes) {
                 if (change.type === 'FULL_REWRITE' || change.type === 'DIFF') {
-                    // Currently treating DIFF as full rewrite if content is provided, or we could add real diff logic later
-                    // For now, prompt instructs FULL_REWRITE
                     const targetPath = path.join(workspaceRoot, change.file_path);
+                    const uri = vscode.Uri.file(targetPath);
+
+                    // Use standard vscode.WorkspaceEdit to modify files in the editor
+                    // This enables Undo/Redo and dirty state visualization (diffs)
                     try {
+                        // Ensure directory exists (helpful for new files even if we use createFile)
                         fs.mkdirSync(path.dirname(targetPath), { recursive: true });
-                        fs.writeFileSync(targetPath, change.content);
+
+                        if (fs.existsSync(targetPath)) {
+                            // Replace existing file content
+                            const doc = await vscode.workspace.openTextDocument(uri);
+                            const fullRange = new vscode.Range(
+                                doc.positionAt(0),
+                                doc.positionAt(doc.getText().length)
+                            );
+                            edit.replace(uri, fullRange, change.content);
+                        } else {
+                            // Create new file
+                            edit.createFile(uri, { overwrite: true });
+                            edit.insert(uri, new vscode.Position(0, 0), change.content);
+                        }
                         appliedCount++;
-                        const fp = String(change.file_path || '').toLowerCase().replace(/\\/g, '/');
-                        if (fp.endsWith('package.json')) { manifestChanged = true; }
                     } catch (err) {
-                        vscode.window.showErrorMessage(`Failed to write ${change.file_path}`);
+                        vscode.window.showErrorMessage(`Failed to prepare edit for ${change.file_path}`);
                     }
                 }
             }
-            vscode.window.showInformationMessage(`Success! Updated ${appliedCount} files.`);
-            if (manifestChanged) {
-                const sel = await vscode.window.showInformationMessage(
-                    'Extension manifest updated. Reload Window to apply UI/menu changes?',
-                    'Reload Now',
-                    'Later'
-                );
-                if (sel === 'Reload Now') {
-                    await vscode.commands.executeCommand('workbench.action.reloadWindow');
+
+            if (appliedCount > 0) {
+                const success = await vscode.workspace.applyEdit(edit);
+                if (success) {
+                    vscode.window.showInformationMessage(`Applied changes to ${appliedCount} files. Please review and save.`);
+                } else {
+                    vscode.window.showErrorMessage("Failed to apply workspace edit.");
                 }
+            } else {
+                vscode.window.showWarningMessage("Status is COMPLETED but no code_changes found.");
             }
         } else {
             vscode.window.showWarningMessage("Status is COMPLETED but no code_changes found.");
@@ -172,12 +187,7 @@ async function handleAIResponse(jsonText: string, workspaceRoot: string, goal: s
         }
         
         // 2. Add Project Structure (copy from round 1 or regen)
-        // Let's just regenerate to be safe/simple, though structure rarely changes mid-task
-        // For simplicity, we skip structure in round 2+ unless requested, or just rely on file context.
-        // But usually helpful to keep the structure available.
         const treePath = path.join(roundDir, '_PROJECT_STRUCTURE.txt');
-        // We can just create an empty one or copy previous if needed. 
-        // Let's copy previous one if exists
         const prevTree = path.join(currentStagingRoot, `round_${currentRound-1}`, '_PROJECT_STRUCTURE.txt');
         if (fs.existsSync(prevTree)) {
             fs.copyFileSync(prevTree, treePath);
