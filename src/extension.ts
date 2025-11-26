@@ -6,6 +6,7 @@ import ignore from 'ignore';
 
 let currentStagingRoot: string = "";
 let currentRound = 1;
+let lastSystemPrompt: string = "";
 
 export function activate(context: vscode.ExtensionContext) {
     let disposable = vscode.commands.registerCommand('ai-bridge.stageWorkspace', async () => {
@@ -77,6 +78,7 @@ export function activate(context: vscode.ExtensionContext) {
 
         // 6. Generate Prompt
         const systemPrompt = generateSystemPrompt(userGoal, stagedFilesList);
+        lastSystemPrompt = systemPrompt;
 
         // 7. UI
         const panel = vscode.window.createWebviewPanel('aiBridge', 'AI Studio Staging', vscode.ViewColumn.Beside, { enableScripts: true });
@@ -121,34 +123,46 @@ async function handleAIResponse(jsonText: string, workspaceRoot: string, goal: s
             const edit = new vscode.WorkspaceEdit();
             let appliedCount = 0;
 
+            const changesByFile = new Map<string, any[]>();
             for (const change of data.code_changes) {
                 if (change.type === 'FULL_REWRITE' || change.type === 'DIFF') {
-                    const targetPath = path.join(workspaceRoot, change.file_path);
-                    const uri = vscode.Uri.file(targetPath);
+                    const arr = changesByFile.get(change.file_path) || [];
+                    arr.push(change);
+                    changesByFile.set(change.file_path, arr);
+                }
+            }
 
-                    // Use standard vscode.WorkspaceEdit to modify files in the editor
-                    // This enables Undo/Redo and dirty state visualization (diffs)
-                    try {
-                        // Ensure directory exists (helpful for new files even if we use createFile)
-                        fs.mkdirSync(path.dirname(targetPath), { recursive: true });
-
-                        if (fs.existsSync(targetPath)) {
-                            // Replace existing file content
-                            const doc = await vscode.workspace.openTextDocument(uri);
-                            const fullRange = new vscode.Range(
-                                doc.positionAt(0),
-                                doc.positionAt(doc.getText().length)
-                            );
-                            edit.replace(uri, fullRange, change.content);
-                        } else {
-                            // Create new file
-                            edit.createFile(uri, { overwrite: true });
-                            edit.insert(uri, new vscode.Position(0, 0), change.content);
-                        }
-                        appliedCount++;
-                    } catch (err) {
-                        vscode.window.showErrorMessage(`Failed to prepare edit for ${change.file_path}`);
+            for (const [filePath, changes] of changesByFile.entries()) {
+                const targetPath = path.join(workspaceRoot, filePath);
+                const uri = vscode.Uri.file(targetPath);
+                try {
+                    fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+                    let workingContent = '';
+                    let doc: vscode.TextDocument | null = null;
+                    if (fs.existsSync(targetPath)) {
+                        doc = await vscode.workspace.openTextDocument(uri);
+                        workingContent = doc.getText();
                     }
+                    for (const change of changes) {
+                        if (change.type === 'FULL_REWRITE') {
+                            workingContent = change.content;
+                        } else {
+                            workingContent = applySearchReplace(workingContent, change.content);
+                        }
+                    }
+                    if (doc) {
+                        const fullRange = new vscode.Range(
+                            doc.positionAt(0),
+                            doc.positionAt(doc.getText().length)
+                        );
+                        edit.replace(uri, fullRange, workingContent);
+                    } else {
+                        edit.createFile(uri, { overwrite: true });
+                        edit.insert(uri, new vscode.Position(0, 0), workingContent);
+                    }
+                    appliedCount++;
+                } catch (err) {
+                    vscode.window.showErrorMessage(`Failed to prepare edit for ${filePath}`);
                 }
             }
 
@@ -165,8 +179,7 @@ async function handleAIResponse(jsonText: string, workspaceRoot: string, goal: s
         } else {
             vscode.window.showWarningMessage("Status is COMPLETED but no code_changes found.");
         }
-    }
-    else if (data.status === 'NEED_CONTEXT') {
+    } else if (data.status === 'NEED_CONTEXT') {
         // Handle Context Request -> New Round
         currentRound++;
         const roundDir = path.join(currentStagingRoot, `round_${currentRound}`);
@@ -186,17 +199,9 @@ async function handleAIResponse(jsonText: string, workspaceRoot: string, goal: s
             }
         }
         
-        // 2. Add Project Structure (copy from round 1 or regen)
-        const treePath = path.join(roundDir, '_PROJECT_STRUCTURE.txt');
-        const prevTree = path.join(currentStagingRoot, `round_${currentRound-1}`, '_PROJECT_STRUCTURE.txt');
-        if (fs.existsSync(prevTree)) {
-            fs.copyFileSync(prevTree, treePath);
-            stagedFiles.push("_PROJECT_STRUCTURE.txt");
-        }
-
-        // 3. Update Prompt
-        const newPrompt = generateSystemPrompt(goal, stagedFiles);
-        updateWebview(panel, newPrompt, roundDir);
+        // 2. Update Webview and Open Folder automatically
+        updateWebview(panel, lastSystemPrompt, roundDir);
+        vscode.env.openExternal(vscode.Uri.file(roundDir));
         
         vscode.window.showInformationMessage(`Round ${currentRound} prepared with ${stagedFiles.length} files.`);
     } else {
@@ -249,7 +254,18 @@ You are an expert coding assistant. Output response in STRICT JSON format, wrapp
 
 A. IF YOU HAVE ENOUGH CONTEXT:
    Set "status": "COMPLETED".
-   Provide the code in "code_changes". Use "FULL_REWRITE" for the file content.
+   Provide the code in "code_changes".
+   - Use "type": "FULL_REWRITE" for new files or when rewriting the entire content.
+   - Use "type": "DIFF" for partial edits. Format content as SEARCH/REPLACE blocks:
+     <<<<<<< SEARCH
+     original code line 1
+     original code line 2
+     =======
+     new code line 1
+     new code line 2
+     >>>>>>> REPLACE
+
+   *Note*: SEARCH must match exact indentation and whitespace. Line endings are normalized (CRLF/LF), but indentation must match exactly.
 
 B. IF YOU NEED MORE CONTEXT:
    Set "status": "NEED_CONTEXT".
@@ -263,11 +279,32 @@ JSON SCHEMA:
   "code_changes": [
     {
       "file_path": "src/components/App.tsx",
-      "type": "FULL_REWRITE", 
+      "type": "FULL_REWRITE" | "DIFF", 
       "content": "..."
     }
   ]
 }`;
+}
+
+function applySearchReplace(original: string, diff: string): string {
+    let result = original;
+    const blockRegex = /<<<<<<< SEARCH\r?\n([\s\S]*?)\r?\n=======\r?\n([\s\S]*?)\r?\n>>>>>>> REPLACE/g;
+    let match;
+    while ((match = blockRegex.exec(diff)) !== null) {
+        const [_, search, replace] = match;
+        // Escape regex special characters in search block
+        const escapedSearch = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        // Normalize line endings to match \r\n, \n, etc.
+        const searchPattern = escapedSearch.split(/\r?\n/).join('\\r?\\n');
+        const searchRegex = new RegExp(searchPattern);
+        
+        if (searchRegex.test(result)) {
+            result = result.replace(searchRegex, replace);
+        } else {
+             vscode.window.showWarningMessage("Could not find SEARCH block in file. Check line endings and indentation.");
+        }
+    }
+    return result;
 }
 
 function updateWebview(panel: vscode.WebviewPanel, prompt: string, folderPath: string) {
