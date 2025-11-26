@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         AI Studio <-> VS Code Bridge
 // @namespace    http://tampermonkey.net/
-// @version      1.1
+// @version      1.2
 // @description  Automate moving text between AI Studio and VS Code
 // @author       You
 // @match        https://aistudio.google.com/*
@@ -32,12 +32,14 @@
         div.style.gap = '10px';
 
         const btnPull = document.createElement('button');
+        btnPull.id = 'btn-pull';
         btnPull.innerText = "⬇️ Load Prompt";
         btnPull.style.padding = '8px';
         btnPull.style.cursor = 'pointer';
-        btnPull.onclick = fetchFromVSCode;
+        btnPull.onclick = () => fetchFromVSCode();
 
         const btnPush = document.createElement('button');
+        btnPush.id = 'btn-push';
         btnPush.innerText = "⬆️ Send Code";
         btnPush.style.padding = '8px';
         btnPush.style.cursor = 'pointer';
@@ -49,7 +51,11 @@
     }
 
     // 1. FETCH FROM VS CODE
-    function fetchFromVSCode() {
+    function fetchFromVSCode(silent = false) {
+        const btn = document.getElementById('btn-pull');
+        const originalText = btn ? btn.innerText : "⬇️ Load Prompt";
+        if (btn) btn.innerText = "⏳ Loading...";
+
         GM_xmlhttpRequest({
             method: "GET",
             url: `${VSCODE_API}/prompt`,
@@ -74,15 +80,25 @@
                         }
 
                         input.dispatchEvent(new Event('input', { bubbles: true }));
-                        alert("Prompt Loaded!");
+                        
+                        if (btn) {
+                            btn.innerText = "✅ Loaded!";
+                            setTimeout(() => btn.innerText = originalText, 2000);
+                        }
+                        // Removed alert as requested
                     } else {
-                        alert("Could not find input box. Click the chat input first.");
+                        if (!silent) alert("Could not find input box. Click the chat input first.");
+                        if (btn) btn.innerText = originalText;
                     }
                 } else {
-                    alert("VS Code not responding.");
+                    if (!silent) alert("VS Code not responding.");
+                    if (btn) btn.innerText = originalText;
                 }
             },
-            onerror: () => alert("Connection failed. Check VS Code.")
+            onerror: () => {
+                if (!silent) alert("Connection failed. Check VS Code.");
+                if (btn) btn.innerText = originalText;
+            }
         });
     }
 
@@ -116,6 +132,10 @@
             return;
         }
 
+        const btn = document.getElementById('btn-push');
+        const originalText = btn ? btn.innerText : "⬆️ Send Code";
+        if (btn) btn.innerText = "⏳ Sending...";
+
         // Send
         GM_xmlhttpRequest({
             method: "POST",
@@ -124,14 +144,27 @@
             data: JSON.stringify({ text: content }),
             onload: function(response) {
                 if (response.status === 200) {
+                    const respData = JSON.parse(response.responseText);
+                    
                     // Visual feedback
-                    const btn = document.querySelector('#ai-bridge-container button:last-child');
-                    const originalText = btn.innerText;
-                    btn.innerText = "✅ Sent!";
-                    setTimeout(() => btn.innerText = originalText, 2000);
+                    if (btn) {
+                        btn.innerText = "✅ Sent!";
+                        setTimeout(() => btn.innerText = originalText, 2000);
+                    }
+
+                    // AUTO-ACTION: If VS Code requests context, pull it automatically
+                    if (respData.result && respData.result.action === 'NEED_CONTEXT') {
+                        // Small delay to let UI settle
+                        setTimeout(() => fetchFromVSCode(true), 500);
+                    }
                 } else {
                     alert("Error sending to VS Code.");
+                    if (btn) btn.innerText = originalText;
                 }
+            },
+            onerror: () => {
+                alert("Connection failed.");
+                if (btn) btn.innerText = originalText;
             }
         });
     }
