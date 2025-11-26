@@ -16,6 +16,7 @@ let server: http.Server | undefined;
 const PORT = 54321;
 
 export function activate(context: vscode.ExtensionContext) {
+    // AI Bridge activation start
     // 1. START LOCAL SERVER
     try {
         server = http.createServer(async (req: http.IncomingMessage, res: http.ServerResponse) => {
