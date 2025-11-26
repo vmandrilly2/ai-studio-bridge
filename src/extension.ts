@@ -322,9 +322,15 @@ async function handleAIResponse(jsonText: string, workspaceRoot: string, goal: s
                         fs.mkdirSync(roundDir, { recursive: true });
                         for (const fp of modifiedFiles) {
                             const srcPath = path.join(workspaceRoot, fp);
-                            if (fs.existsSync(srcPath)) {
-                                const flatName = fp.split('/').join('__') + '.txt';
-                                fs.copyFileSync(srcPath, path.join(roundDir, flatName));
+                            const flatName = fp.split('/').join('__') + '.txt';
+                            const destPath = path.join(roundDir, flatName);
+
+                            // Use open document text to capture unsaved changes (Edit just applied)
+                            const openDoc = vscode.workspace.textDocuments.find(d => d.uri.fsPath === srcPath);
+                            if (openDoc) {
+                                fs.writeFileSync(destPath, openDoc.getText());
+                            } else if (fs.existsSync(srcPath)) {
+                                fs.copyFileSync(srcPath, destPath);
                             }
                         }
                         currentRoundDir = roundDir;
