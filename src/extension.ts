@@ -2,21 +2,90 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import * as http from 'http';
 import ignore from 'ignore';
 
 let currentStagingRoot: string = "";
+let currentRoundDir: string = "";
+let currentWorkspaceRoot: string = "";
+let currentUserGoal: string = "";
 let currentRound = 1;
 let lastSystemPrompt: string = "";
+let currentPanel: vscode.WebviewPanel | undefined;
+let server: http.Server | undefined;
+const PORT = 54321;
 
 export function activate(context: vscode.ExtensionContext) {
+    // 1. START LOCAL SERVER
+    try {
+        server = http.createServer(async (req, res) => {
+            // Fix for CORS and Private Network Access (PNA) blocks in Chrome/Firefox
+            res.setHeader('Access-Control-Allow-Origin', '*');
+            res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+            res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+            res.setHeader('Access-Control-Allow-Private-Network', 'true');
+
+            if (req.method === 'OPTIONS') {
+                res.writeHead(204);
+                res.end();
+                return;
+            }
+
+            // ENDPOINT: GET /prompt (Browser asks for the task)
+            if (req.method === 'GET' && req.url === '/prompt') {
+                if (!currentRoundDir || !fs.existsSync(currentRoundDir)) {
+                     // Graceful fallback if user hasn't staged yet
+                     const warning = "WARNING: No files staged. Please run 'AI Bridge: Stage Workspace' in VS Code first.";
+                     res.writeHead(200, { 'Content-Type': 'application/json' });
+                     res.end(JSON.stringify({ prompt: warning }));
+                     return;
+                }
+                const fullPayload = await getPromptWithFiles(currentRoundDir, lastSystemPrompt);
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ prompt: fullPayload }));
+                return;
+            }
+
+            // ENDPOINT: POST /response (Browser sends the AI solution)
+            if (req.method === 'POST' && req.url === '/response') {
+                let body = '';
+                req.on('data', chunk => body += chunk);
+                req.on('end', () => {
+                    try {
+                        const data = JSON.parse(body);
+                        vscode.commands.executeCommand('ai-bridge.applyResponse', data.text);
+                        res.writeHead(200, { 'Content-Type': 'application/json' });
+                        res.end(JSON.stringify({ status: 'received' }));
+                    } catch (e) {
+                        res.writeHead(400);
+                        res.end('Invalid JSON');
+                    }
+                });
+                return;
+            }
+
+            res.writeHead(404);
+            res.end();
+        });
+
+        server.listen(PORT, () => {
+            console.log(`AI Bridge Server running on port ${PORT}`);
+        });
+    } catch (e) {
+        console.error("Failed to start AI Bridge server", e);
+    }
+
+    // 2. STAGE COMMAND
     let disposable = vscode.commands.registerCommand('ai-bridge.stageWorkspace', async () => {
         currentRound = 1;
         
-        // 1. Setup Staging
+        // Setup Staging
         const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
         currentStagingRoot = path.join(os.tmpdir(), 'ai-bridge', timestamp);
         const round1Dir = path.join(currentStagingRoot, 'round_1');
         fs.mkdirSync(round1Dir, { recursive: true });
+
+        currentRoundDir = round1Dir;
 
         let workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
         if (!workspaceFolder) {
@@ -30,7 +99,9 @@ export function activate(context: vscode.ExtensionContext) {
             workspaceFolder = picked[0].fsPath;
         }
 
-        // 2. Initialize Ignore Filter
+        currentWorkspaceRoot = workspaceFolder;
+
+        // Initialize Ignore Filter
         const ig = ignore();
         ig.add(['.git', '.vscode', 'node_modules', 'dist', 'out', 'build', '__pycache__', '.DS_Store', 'venv', '.env']);
         const gitIgnorePath = path.join(workspaceFolder, '.gitignore');
@@ -42,7 +113,7 @@ export function activate(context: vscode.ExtensionContext) {
 
         const stagedFilesList: string[] = [];
 
-        // 3. Generate Tree
+        // Generate Tree
         try {
             const tree = generateFileTree(workspaceFolder, workspaceFolder, "", ig);
             const treePath = path.join(round1Dir, '_PROJECT_STRUCTURE.txt');
@@ -52,7 +123,7 @@ export function activate(context: vscode.ExtensionContext) {
             console.error("Error generating tree", err);
         }
 
-        // 4. Stage Opened Files
+        // Stage Opened Files
         const openDocs = vscode.workspace.textDocuments;
         for (const doc of openDocs) {
             if (doc.uri.scheme === 'file' && doc.fileName.startsWith(workspaceFolder)) {
@@ -60,7 +131,6 @@ export function activate(context: vscode.ExtensionContext) {
                 if (ig.ignores(relativePath)) { continue; }
                 if (relativePath.includes('_PROJECT_STRUCTURE')) { continue; }
 
-                // Flatten and append .txt
                 const flatName = relativePath.split(path.sep).join('__') + '.txt';
                 const destPath = path.join(round1Dir, flatName);
                 
@@ -69,19 +139,22 @@ export function activate(context: vscode.ExtensionContext) {
             }
         }
 
-        // 5. User Goal
+        // User Goal
         const userGoal = await vscode.window.showInputBox({ 
             prompt: "What is your goal?",
             placeHolder: "e.g. Fix the login bug in AuthController"
         });
         if (!userGoal) { return; }
+        
+        currentUserGoal = userGoal;
 
-        // 6. Generate Prompt
+        // Generate Prompt
         const systemPrompt = generateSystemPrompt(userGoal, stagedFilesList);
         lastSystemPrompt = systemPrompt;
 
-        // 7. UI
+        // UI
         const panel = vscode.window.createWebviewPanel('aiBridge', 'AI Studio Staging', vscode.ViewColumn.Beside, { enableScripts: true });
+        currentPanel = panel;
         updateWebview(panel, systemPrompt, round1Dir);
         
         panel.webview.onDidReceiveMessage(async message => {
@@ -90,15 +163,26 @@ export function activate(context: vscode.ExtensionContext) {
                 vscode.env.openExternal(vscode.Uri.file(dirToOpen));
             }
             else if (message.command === 'processResponse') {
-                await handleAIResponse(message.text, workspaceFolder!, userGoal, panel);
+                await handleAIResponse(message.text, workspaceFolder!, userGoal);
             }
         });
+
+        panel.onDidDispose(() => { currentPanel = undefined; }, null, context.subscriptions);
     });
 
-    context.subscriptions.push(disposable);
+    // 3. APPLY COMMAND (INTERNAL)
+    let applyDisposable = vscode.commands.registerCommand('ai-bridge.applyResponse', async (jsonText: string) => {
+        if (currentWorkspaceRoot) {
+            await handleAIResponse(jsonText, currentWorkspaceRoot, currentUserGoal);
+        } else {
+             vscode.window.showErrorMessage("No active workspace context. Run 'Stage Workspace' first.");
+        }
+    });
+
+    context.subscriptions.push(disposable, applyDisposable);
 }
 
-async function handleAIResponse(jsonText: string, workspaceRoot: string, goal: string, panel: vscode.WebviewPanel) {
+async function handleAIResponse(jsonText: string, workspaceRoot: string, goal: string) {
     let data: any;
     try {
         let cleanJson = jsonText.trim();
@@ -185,6 +269,7 @@ async function handleAIResponse(jsonText: string, workspaceRoot: string, goal: s
         const roundDir = path.join(currentStagingRoot, `round_${currentRound}`);
         fs.mkdirSync(roundDir, { recursive: true });
 
+        currentRoundDir = roundDir;
         const stagedFiles: string[] = [];
 
         // 1. Copy requested files
@@ -199,14 +284,30 @@ async function handleAIResponse(jsonText: string, workspaceRoot: string, goal: s
             }
         }
         
-        // 2. Update Webview and Open Folder automatically
-        updateWebview(panel, lastSystemPrompt, roundDir);
-        vscode.env.openExternal(vscode.Uri.file(roundDir));
+        // 2. Update Webview (if active) and Open Folder
+        if (currentPanel) {
+            updateWebview(currentPanel, lastSystemPrompt, roundDir);
+        }
         
         vscode.window.showInformationMessage(`Round ${currentRound} prepared with ${stagedFiles.length} files.`);
     } else {
         vscode.window.showWarningMessage("Response missing valid status. Paste either an object with 'status' or an array of code changes.");
     }
+}
+
+async function getPromptWithFiles(stagingDir: string, basePrompt: string): Promise<string> {
+    let hugePrompt = basePrompt + "\n\n=== ATTACHED FILES ===\n";
+    if (!fs.existsSync(stagingDir)) return hugePrompt;
+
+    const files = fs.readdirSync(stagingDir);
+    for (const file of files) {
+        const fullPath = path.join(stagingDir, file);
+        if (fs.statSync(fullPath).isFile()) {
+            const content = fs.readFileSync(fullPath, 'utf-8');
+            hugePrompt += `\n--- START OF FILE ${file} ---\n${content}\n--- END OF FILE ---\n`;
+        }
+    }
+    return hugePrompt;
 }
 
 function generateFileTree(currentDir: string, rootDir: string, prefix: string, ig: any): string {
@@ -292,9 +393,7 @@ function applySearchReplace(original: string, diff: string): string {
     let match;
     while ((match = blockRegex.exec(diff)) !== null) {
         const [_, search, replace] = match;
-        // Escape regex special characters in search block
         const escapedSearch = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        // Normalize line endings to match \r\n, \n, etc.
         const searchPattern = escapedSearch.split(/\r?\n/).join('\\r?\\n');
         const searchRegex = new RegExp(searchPattern);
         
@@ -350,4 +449,6 @@ function updateWebview(panel: vscode.WebviewPanel, prompt: string, folderPath: s
     </html>`;
 }
 
-export function deactivate() {}
+export function deactivate() {
+    if (server) { server.close(); }
+}
