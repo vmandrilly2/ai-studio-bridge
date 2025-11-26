@@ -2,12 +2,14 @@ import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import ignore from 'ignore'; 
+import ignore from 'ignore';
 
 let currentStagingRoot: string = "";
+let currentRound = 1;
 
 export function activate(context: vscode.ExtensionContext) {
     let disposable = vscode.commands.registerCommand('ai-bridge.stageWorkspace', async () => {
+        currentRound = 1;
         
         // 1. Setup Staging
         const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
@@ -15,31 +17,32 @@ export function activate(context: vscode.ExtensionContext) {
         const round1Dir = path.join(currentStagingRoot, 'round_1');
         fs.mkdirSync(round1Dir, { recursive: true });
 
-        const workspaceFolder = vscode.workspace.workspaceFolders?.[0].uri.fsPath;
+        let workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
         if (!workspaceFolder) {
-            vscode.window.showErrorMessage("Please open a folder/workspace first.");
-            return;
+            const picked = await vscode.window.showOpenDialog({ 
+                canSelectFolders: true,
+                canSelectFiles: false,
+                canSelectMany: false,
+                title: "Select a workspace folder to stage"
+            });
+            if (!picked || picked.length === 0) { vscode.window.showErrorMessage("No folder selected."); return; }
+            workspaceFolder = picked[0].fsPath;
+        }
+
+        // 2. Initialize Ignore Filter
+        const ig = ignore();
+        ig.add(['.git', '.vscode', 'node_modules', 'dist', 'out', 'build', '__pycache__', '.DS_Store', 'venv', '.env']);
+        const gitIgnorePath = path.join(workspaceFolder, '.gitignore');
+        if (fs.existsSync(gitIgnorePath)) {
+            try {
+                ig.add(fs.readFileSync(gitIgnorePath, 'utf-8'));
+            } catch (e) { console.log("Could not read .gitignore"); }
         }
 
         const stagedFilesList: string[] = [];
 
-        // 2. Initialize Ignore Filter (Root Level)
-        const ig = ignore();
-        // Always ignore these common clutter folders
-        ig.add(['.git', '.vscode', 'node_modules', 'dist', 'out', 'build', '__pycache__', '.DS_Store', 'venv', '.env']);
-        
-        // Load root .gitignore
-        const gitIgnorePath = path.join(workspaceFolder, '.gitignore');
-        if (fs.existsSync(gitIgnorePath)) {
-            try {
-                const gitIgnoreContent = fs.readFileSync(gitIgnorePath, 'utf-8');
-                ig.add(gitIgnoreContent);
-            } catch (e) { console.log("Could not read .gitignore"); }
-        }
-
         // 3. Generate Tree
         try {
-            // We pass the Workspace Root as the 'base' for calculating relative paths
             const tree = generateFileTree(workspaceFolder, workspaceFolder, "", ig);
             const treePath = path.join(round1Dir, '_PROJECT_STRUCTURE.txt');
             fs.writeFileSync(treePath, tree);
@@ -53,13 +56,11 @@ export function activate(context: vscode.ExtensionContext) {
         for (const doc of openDocs) {
             if (doc.uri.scheme === 'file' && doc.fileName.startsWith(workspaceFolder)) {
                 const relativePath = path.relative(workspaceFolder, doc.fileName);
-                
-                // Skip if it's ignored by git (optional, but good practice)
-                if (ig.ignores(relativePath)) continue;
-                if (relativePath.includes('_PROJECT_STRUCTURE')) continue;
+                if (ig.ignores(relativePath)) { continue; }
+                if (relativePath.includes('_PROJECT_STRUCTURE')) { continue; }
 
-                // Flatten: src/utils/helper.ts -> src__utils__helper.ts
-                const flatName = relativePath.split(path.sep).join('__');
+                // Flatten and append .txt
+                const flatName = relativePath.split(path.sep).join('__') + '.txt';
                 const destPath = path.join(round1Dir, flatName);
                 
                 fs.writeFileSync(destPath, doc.getText());
@@ -79,12 +80,15 @@ export function activate(context: vscode.ExtensionContext) {
 
         // 7. UI
         const panel = vscode.window.createWebviewPanel('aiBridge', 'AI Studio Staging', vscode.ViewColumn.Beside, { enableScripts: true });
-        panel.webview.html = getWebviewContent(systemPrompt, round1Dir);
+        updateWebview(panel, systemPrompt, round1Dir);
         
         panel.webview.onDidReceiveMessage(async message => {
             if (message.command === 'openFolder') {
                 const dirToOpen = message.path || round1Dir;
                 vscode.env.openExternal(vscode.Uri.file(dirToOpen));
+            }
+            else if (message.command === 'processResponse') {
+                await handleAIResponse(message.text, workspaceFolder!, userGoal, panel);
             }
         });
     });
@@ -92,64 +96,115 @@ export function activate(context: vscode.ExtensionContext) {
     context.subscriptions.push(disposable);
 }
 
-/**
- * Recursive Tree Generator
- * @param currentDir The absolute path of the directory we are currently crawling
- * @param rootDir The absolute path of the workspace root (used to calculate relative paths for .gitignore)
- * @param prefix The visual prefix for the tree (│   ├── )
- * @param ig The ignore instance
- */
+async function handleAIResponse(jsonText: string, workspaceRoot: string, goal: string, panel: vscode.WebviewPanel) {
+    let data;
+    try {
+        data = JSON.parse(jsonText);
+    } catch (e) {
+        vscode.window.showErrorMessage("Invalid JSON. Please ensure you pasted the full code block.");
+        return;
+    }
+
+    if (data.status === 'COMPLETED') {
+        if (data.code_changes && Array.isArray(data.code_changes)) {
+            let appliedCount = 0;
+            for (const change of data.code_changes) {
+                if (change.type === 'FULL_REWRITE' || change.type === 'DIFF') {
+                    // Currently treating DIFF as full rewrite if content is provided, or we could add real diff logic later
+                    // For now, prompt instructs FULL_REWRITE
+                    const targetPath = path.join(workspaceRoot, change.file_path);
+                    try {
+                        fs.mkdirSync(path.dirname(targetPath), { recursive: true });
+                        fs.writeFileSync(targetPath, change.content);
+                        appliedCount++;
+                    } catch (err) {
+                        vscode.window.showErrorMessage(`Failed to write ${change.file_path}`);
+                    }
+                }
+            }
+            vscode.window.showInformationMessage(`Success! Updated ${appliedCount} files.`);
+        } else {
+            vscode.window.showWarningMessage("Status is COMPLETED but no code_changes found.");
+        }
+    }
+    else if (data.status === 'NEED_CONTEXT') {
+        // Handle Context Request -> New Round
+        currentRound++;
+        const roundDir = path.join(currentStagingRoot, `round_${currentRound}`);
+        fs.mkdirSync(roundDir, { recursive: true });
+
+        const stagedFiles: string[] = [];
+
+        // 1. Copy requested files
+        if (data.request_files && Array.isArray(data.request_files)) {
+            for (const reqFile of data.request_files) {
+                const srcPath = path.join(workspaceRoot, reqFile);
+                if (fs.existsSync(srcPath)) {
+                     const flatName = reqFile.split('/').join('__') + '.txt';
+                     fs.copyFileSync(srcPath, path.join(roundDir, flatName));
+                     stagedFiles.push(reqFile);
+                }
+            }
+        }
+        
+        // 2. Add Project Structure (copy from round 1 or regen)
+        // Let's just regenerate to be safe/simple, though structure rarely changes mid-task
+        // For simplicity, we skip structure in round 2+ unless requested, or just rely on file context.
+        // But usually helpful to keep the structure available.
+        const treePath = path.join(roundDir, '_PROJECT_STRUCTURE.txt');
+        // We can just create an empty one or copy previous if needed. 
+        // Let's copy previous one if exists
+        const prevTree = path.join(currentStagingRoot, `round_${currentRound-1}`, '_PROJECT_STRUCTURE.txt');
+        if (fs.existsSync(prevTree)) {
+            fs.copyFileSync(prevTree, treePath);
+            stagedFiles.push("_PROJECT_STRUCTURE.txt");
+        }
+
+        // 3. Update Prompt
+        const newPrompt = generateSystemPrompt(goal, stagedFiles);
+        updateWebview(panel, newPrompt, roundDir);
+        
+        vscode.window.showInformationMessage(`Round ${currentRound} prepared with ${stagedFiles.length} files.`);
+    }
+}
+
 function generateFileTree(currentDir: string, rootDir: string, prefix: string, ig: any): string {
     let output = '';
     let entries: fs.Dirent[] = [];
-    
     try {
         entries = fs.readdirSync(currentDir, { withFileTypes: true });
     } catch (e) { return ''; }
 
-    // Sort: Directories first, then files
     entries.sort((a, b) => {
-        if (a.isDirectory() && !b.isDirectory()) return -1;
-        if (!a.isDirectory() && b.isDirectory()) return 1;
+        if (a.isDirectory() && !b.isDirectory()) { return -1; }
+        if (!a.isDirectory() && b.isDirectory()) { return 1; }
         return a.name.localeCompare(b.name);
     });
 
-    // Filter entries using the Ignore instance
     const filteredEntries = entries.filter(entry => {
         const absolutePath = path.join(currentDir, entry.name);
-        // Get path relative to WORKSPACE ROOT (e.g., "Backend/venv")
         let relativePath = path.relative(rootDir, absolutePath);
-        
-        // Convert Windows backslashes to forward slashes for the 'ignore' library
         relativePath = relativePath.split(path.sep).join('/');
-
-        // If it's a directory, the ignore lib sometimes likes a trailing slash to match rules like "folder/"
-        if (entry.isDirectory()) {
-            relativePath += '/';
-        }
-
+        if (entry.isDirectory()) { relativePath += '/'; }
         return !ig.ignores(relativePath);
     });
 
     filteredEntries.forEach((entry, index) => {
         const isLast = index === filteredEntries.length - 1;
         const marker = isLast ? '└── ' : '├── ';
-        
         output += `${prefix}${marker}${entry.name}\n`;
-        
         if (entry.isDirectory()) {
             const newPrefix = prefix + (isLast ? '    ' : '│   ');
             output += generateFileTree(path.join(currentDir, entry.name), rootDir, newPrefix, ig);
         }
     });
-    
     return output;
 }
 
 function generateSystemPrompt(goal: string, fileList: string[]): string {
-    return `I am attaching a set of files. 
-1. "_PROJECT_STRUCTURE.txt": Contains the full file tree of the codebase (respecting .gitignore).
-2. Source code files: These are the tabs I currently have open. (Note: filenames are flattened, e.g. "src__utils.ts" maps to "src/utils.ts").
+    return `I am attaching a set of files.
+1. "_PROJECT_STRUCTURE.txt": Contains the full file tree.
+2. Source code files: Flattened filenames ending in .txt (e.g. "src__utils.ts.txt" maps to "src/utils.ts").
 
 GOAL: ${goal}
 
@@ -158,20 +213,17 @@ You are an expert coding assistant. Output response in STRICT JSON.
 
 A. IF YOU HAVE ENOUGH CONTEXT:
    Set "status": "COMPLETED".
-   Provide the code in "code_changes". You can provide a "FULL_REWRITE" or a "DIFF" (unified diff format).
+   Provide the code in "code_changes". Use "FULL_REWRITE" for the file content.
 
 B. IF YOU NEED MORE CONTEXT:
    Set "status": "NEED_CONTEXT".
-   1. Check "_PROJECT_STRUCTURE.txt" to see what files exist.
-   2. Request specific files using "request_files".
-   3. If you don't know the filename, use "search_queries" to run a text search on the codebase (e.g. "definition of User interface").
+   1. Request specific files using "request_files".
 
 JSON SCHEMA:
 {
   "status": "NEED_CONTEXT" | "COMPLETED",
-  "reasoning": "Brief explanation of your plan",
-  "request_files": ["path/to/file1", "src/utils/helper.ts"],
-  "search_queries": ["text to find"],
+  "reasoning": "Brief explanation",
+  "request_files": ["src/utils/helper.ts"],
   "code_changes": [
     {
       "file_path": "src/components/App.tsx",
@@ -182,27 +234,44 @@ JSON SCHEMA:
 }`;
 }
 
-function getWebviewContent(prompt: string, folderPath: string) {
+function updateWebview(panel: vscode.WebviewPanel, prompt: string, folderPath: string) {
     const safePath = folderPath.replace(/\\/g, '\\\\');
-    return `
+    panel.webview.html = `
     <html>
-    <body style="font-family: sans-serif; padding: 20px;">
-        <h2>🚀 Staging Complete</h2>
+    <body style="font-family: sans-serif; padding: 20px; background-color: #1e1e1e; color: #ccccc7;">
+        <h2>🚀 AI Studio Bridge</h2>
+        
         <div style="background: #252526; padding: 15px; border-radius: 5px; margin-bottom: 20px;">
-            <h3 style="margin-top:0;">1. Files Ready</h3>
-            <p>Folder contains your open tabs + Project Structure.</p>
-            <button onclick="openFolder()" style="padding: 8px 16px; cursor: pointer;">📂 Open Folder (Ctrl+A -> Drag to AI Studio)</button>
+            <h3 style="margin-top:0;">1. Stage Files</h3>
+            <p>Files staged at: <code>${folderPath}</code></p>
+            <button onclick="openFolder()" style="padding: 8px 16px; cursor: pointer; background: #007acc; color: white; border: none; border-radius: 3px;">📂 Open Folder</button>
+            <p style="font-size: 0.9em; color: #aaa;">Tip: Select All -> Drag to AI Studio</p>
         </div>
-        <div style="background: #252526; padding: 15px; border-radius: 5px;">
+
+        <div style="background: #252526; padding: 15px; border-radius: 5px; margin-bottom: 20px;">
             <h3 style="margin-top:0;">2. System Prompt</h3>
-            <textarea id="p" style="width:100%; height:200px; background: #1e1e1e; color: #d4d4d4; border: 1px solid #3c3c3c;">${prompt}</textarea>
+            <textarea id="p" style="width:100%; height:150px; background: #3c3c3c; color: #d4d4d4; border: 1px solid #555;">${prompt}</textarea>
             <br/><br/>
-            <button onclick="copyText()" style="padding: 8px 16px; cursor: pointer;">📋 Copy Prompt</button>
+            <button onclick="copyText()" style="padding: 8px 16px; cursor: pointer; background: #444; color: white; border: none; border-radius: 3px;">📋 Copy Prompt</button>
         </div>
+
+        <div style="background: #252526; padding: 15px; border-radius: 5px;">
+            <h3 style="margin-top:0;">3. Apply AI Response</h3>
+            <p>Paste the JSON response from AI Studio below:</p>
+            <textarea id="aiInput" placeholder="{ \"status\": ... }" style="width:100%; height:150px; background: #3c3c3c; color: #d4d4d4; border: 1px solid #555;"></textarea>
+            <br/><br/>
+            <button onclick="processResponse()" style="padding: 8px 16px; cursor: pointer; background: #0e639c; color: white; border: none; border-radius: 3px;">▶️ Apply / Next Step</button>
+        </div>
+
         <script>
             const vscode = acquireVsCodeApi();
             function openFolder() { vscode.postMessage({command: 'openFolder', path: '${safePath}'}); }
             function copyText() { document.getElementById('p').select(); document.execCommand('copy'); }
+            function processResponse() {
+                const text = document.getElementById('aiInput').value;
+                if (!text.trim()) return;
+                vscode.postMessage({command: 'processResponse', text: text});
+            }
         </script>
     </body>
     </html>`;
